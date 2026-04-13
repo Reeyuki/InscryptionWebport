@@ -80,6 +80,8 @@
         loaded: 0,
         done: false
       }
+      const EXPECTED_DATA_TOTAL_BYTES = 1448 * 1048576
+      const DATA_DOWNLOAD_CONCURRENCY = 8
 
       function mb(v) {
         return v / 1048576
@@ -107,55 +109,143 @@
 
       const nativeFetch = window.fetch
 
-      window.fetch = async function(input, init) {
-        const url = typeof input === "string" ? input : input.url
-
-        if (!url.includes("473b9593aa93436d0dfd3c30217f126b.data")) {
-          return nativeFetch(input, init)
-        }
-
-        const base = "Build/473b9593aa93436d0dfd3c30217f126b.data.part_"
-        const alphabet = "abcdefghijklmnopqrstuvwxyz"
-
+      async function fetchByKnownParts(partUrls, contentType, trackProgress) {
         const chunks = []
-        let totalBytes = 0
         let loadedBytes = 0
 
-        for (let i = 0; i < alphabet.length; i++) {
-          for (let j = 0; j < alphabet.length; j++) {
-            const suffix = alphabet[i] + alphabet[j]
-            const partUrl = base + suffix
+        if (trackProgress) {
+          state.total = 0
+          state.loaded = 0
+          state.done = false
+          render()
+        }
 
-            const res = await nativeFetch(partUrl)
+        for (const partUrl of partUrls) {
+          const res = await nativeFetch(partUrl)
+          if (!res.ok) {
+            throw new Error("Missing chunk: " + partUrl)
+          }
 
-            if (!res.ok) {
-              state.total = totalBytes
-              state.loaded = loadedBytes
-              state.done = true
-              render()
-              const blob = new Blob(chunks)
-              return new Response(blob)
-            }
+          const buf = await res.arrayBuffer()
+          chunks.push(buf)
+          loadedBytes += buf.byteLength
 
-            const buf = await res.arrayBuffer()
-            chunks.push(buf)
-
-            loadedBytes += buf.byteLength
-            totalBytes += buf.byteLength
-
-            state.total = totalBytes
+          if (trackProgress) {
+            state.total = loadedBytes
             state.loaded = loadedBytes
             render()
           }
         }
 
-        state.total = totalBytes
-        state.loaded = loadedBytes
-        state.done = true
-        render()
+        if (trackProgress) {
+          state.done = true
+          render()
+        }
 
-        const blob = new Blob(chunks)
-        return new Response(blob)
+        const blob = new Blob(chunks, contentType ? { type: contentType } : {})
+        return new Response(blob, {
+          status: 200,
+          headers: contentType ? { "Content-Type": contentType } : {}
+        })
+      }
+
+      function suffixFromIndex(index) {
+        const alphabet = "abcdefghijklmnopqrstuvwxyz"
+        const first = Math.floor(index / alphabet.length)
+        const second = index % alphabet.length
+        return alphabet[first] + alphabet[second]
+      }
+
+      async function fetchByAlphabetParts(base, trackProgress) {
+        const alphabet = "abcdefghijklmnopqrstuvwxyz"
+        const maxParts = alphabet.length * alphabet.length
+        const chunks = new Array(maxParts)
+        let loadedBytes = 0
+        let nextIndex = 0
+        let stopIndex = maxParts
+
+        if (trackProgress) {
+          state.total = EXPECTED_DATA_TOTAL_BYTES
+          state.loaded = 0
+          state.done = false
+          render()
+        }
+
+        async function worker() {
+          while (true) {
+            const partIndex = nextIndex
+            nextIndex += 1
+
+            if (partIndex >= stopIndex) {
+              return
+            }
+
+            const suffix = suffixFromIndex(partIndex)
+            const partUrl = base + suffix
+            const res = await nativeFetch(partUrl)
+
+            if (!res.ok) {
+              if (partIndex < stopIndex) {
+                stopIndex = partIndex
+              }
+              continue
+            }
+
+            const buf = await res.arrayBuffer()
+            chunks[partIndex] = buf
+            loadedBytes += buf.byteLength
+
+            if (trackProgress) {
+              state.loaded = Math.min(EXPECTED_DATA_TOTAL_BYTES, loadedBytes)
+              render()
+            }
+          }
+        }
+
+        const workers = []
+        const workerCount = Math.min(DATA_DOWNLOAD_CONCURRENCY, maxParts)
+        for (let i = 0; i < workerCount; i++) {
+          workers.push(worker())
+        }
+        await Promise.all(workers)
+
+        const orderedChunks = []
+        for (let i = 0; i < stopIndex; i++) {
+          if (!chunks[i]) {
+            throw new Error("Missing data chunk at index " + i)
+          }
+          orderedChunks.push(chunks[i])
+        }
+
+        if (trackProgress) {
+          state.total = EXPECTED_DATA_TOTAL_BYTES
+          state.loaded = EXPECTED_DATA_TOTAL_BYTES
+          state.done = true
+          render()
+        }
+
+        const blob = new Blob(orderedChunks)
+        return new Response(blob, { status: 200 })
+      }
+
+      window.fetch = async function(input, init) {
+        const url = typeof input === "string" ? input : input.url
+
+        if (url.includes("473b9593aa93436d0dfd3c30217f126b.data")) {
+          return fetchByAlphabetParts("Build/473b9593aa93436d0dfd3c30217f126b.data.part_", true)
+        }
+
+        if (url.includes("2a21aa2df9743ada0aa5cac7d789934d.wasm")) {
+          return fetchByKnownParts([
+            "Build/2a21aa2df9743ada0aa5cac7d789934d.wasm.part_00",
+            "Build/2a21aa2df9743ada0aa5cac7d789934d.wasm.part_01",
+            "Build/2a21aa2df9743ada0aa5cac7d789934d.wasm.part_02",
+            "Build/2a21aa2df9743ada0aa5cac7d789934d.wasm.part_03",
+            "Build/2a21aa2df9743ada0aa5cac7d789934d.wasm.part_04"
+          ], "application/wasm", false)
+        }
+
+        return nativeFetch(input, init)
       }
 
       const canvas = document.getElementById("unity-canvas")
